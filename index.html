@@ -687,20 +687,22 @@ for (const [btnId, boxId] of SHELVES) {
 // correction that makes the photo match what your adapted eye sees under it.
 // Bluer light -> stronger correction, but keep some blue mood (the eye never
 // fully adapts) and protect fluorescence, which the eye sees vividly.
-// [wbGains, tone, fluor, saturation, clarity]
+// [wbGains, tone, fluor, saturation, clarity, tint]
+// tint: green bias scales with blue-correction strength — under heavy blue,
+// plain gains render grey rock purplish (red+blue win over green).
 const PRESETS = {
-  windex:  [[3.2, 1.0, 0.45], 45, 85, 105, 20],  // heavy blue: strong fix, keep glow
-  actinic: [[2.2, 1.0, 0.60], 55, 90, 110, 15],  // fluorescence is the subject
-  mixed:   [[2.4, 1.0, 0.60], 35, 55, 105, 25],  // your tank: T5-ish middle ground
-  white:   [[1.5, 1.0, 0.85], 15, 30, 100, 30],  // near-daylight: gentle nudge
+  windex:  [[3.2, 1.0, 0.45], 45, 85, 105, 20, 30],  // heavy blue: strong fix, keep glow
+  actinic: [[2.2, 1.0, 0.60], 55, 90, 110, 15, 25],  // fluorescence is the subject
+  mixed:   [[2.4, 1.0, 0.60], 35, 55, 105, 25, 20],  // your tank: T5-ish middle ground
+  white:   [[1.5, 1.0, 0.85], 15, 30, 100, 30,  5],  // near-daylight: gentle nudge
 };
 for (const btn of document.querySelectorAll("#presets button[data-preset]")) {
   btn.onclick = () => {
-    const [g, tone, fluor, sat, clar] = PRESETS[btn.dataset.preset];
+    const [g, tone, fluor, sat, clar, tint] = PRESETS[btn.dataset.preset];
     wbGains = g.slice();
     $("tone").value = tone; $("fluor").value = fluor; $("saturation").value = sat;
-    $("clarity").value = clar;
-    $("red").value = 100; $("blue").value = 100; $("tintGM").value = 0; $("strength").value = 100;
+    $("clarity").value = clar; $("tintGM").value = tint;
+    $("red").value = 100; $("blue").value = 100; $("strength").value = 100;
     $("hint").style.opacity = 0;
   };
 }
