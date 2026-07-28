@@ -161,8 +161,16 @@ void main() {
   // gains neutralize the cast; tint re-aims the result at a chosen
   // white point (T5-ish cool blue instead of flat gray).
   lin = mix(lin * gains * tint, lin, protect) * exposure;
+  // Soft highlight shoulder: compress bright values instead of hard-clipping.
+  // Hard clamp flattens boosted areas into featureless patches; this keeps
+  // texture (sand, clam mantle) without needing to dial exposure back.
+  vec3 over = step(vec3(0.75), lin);
+  vec3 shoulder = 0.75 + 0.25 * (1.0 - exp(-(lin - 0.75) / 0.25));
+  lin = mix(lin, shoulder, over);
   float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
-  lin = mix(vec3(luma), lin, saturation);
+  // Ease saturation toward neutral in highlights so bright areas stay clean.
+  float satEff = mix(saturation, min(saturation, 1.0), smoothstep(0.6, 1.0, luma));
+  lin = mix(vec3(luma), lin, satEff);
   vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
   gl_FragColor = vec4(mix(outc, c, bypass), 1.0);
 }
