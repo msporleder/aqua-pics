@@ -87,6 +87,7 @@
     <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
     <div class="row"><label>Blue cut</label><input type="range" id="blue" min="20" max="100" value="100"></div>
     <div class="row"><label>Fluor keep</label><input type="range" id="fluor" min="0" max="100" value="50"></div>
+    <div class="row"><label>Clarity</label><input type="range" id="clarity" min="0" max="100" value="25"></div>
     <div class="row"><label>Denoise</label><input type="range" id="denoise" min="0" max="100" value="60"></div>
     <div class="row"><label>Strength</label><input type="range" id="strength" min="0" max="100" value="100"></div>
     <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
@@ -94,11 +95,12 @@
   </div>
   <div id="camCtl" class="collapsed"></div>
   <div id="presets" class="collapsed">
+    <div class="row" style="font-size:11px;color:#9ab">What are you looking at? Picks the correction to match your eyes.</div>
     <div class="row">
-      <button data-preset="t5">T5 look</button>
-      <button data-preset="glow">Actinic glow</button>
-      <button data-preset="daylight">Daylight</button>
-      <button data-preset="windex">Windex</button>
+      <button data-preset="windex">Windex tank</button>
+      <button data-preset="actinic">Actinic only</button>
+      <button data-preset="mixed">White+blue</button>
+      <button data-preset="white">Mostly white</button>
     </div>
   </div>
   <div id="more" class="collapsed">
@@ -135,39 +137,73 @@ varying vec2 uv;
 void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }
 `;
 
-// White balance is applied in (approximately) linear light: decode sRGB,
-// apply per-channel gains + exposure, adjust saturation, re-encode.
+// Color pipeline, in order: decode sRGB -> clarity (local contrast) ->
+// white balance via Bradford chromatic adaptation (scale in cone-response
+// space, not raw RGB, so strong corrections don't skew hues) -> tint toward
+// target white point -> fluorescence protection -> exposure -> Hable filmic
+// tone curve (soft toe + shoulder instead of hard clip) -> highlight
+// desaturation -> re-encode.
 const FS = `
 precision highp float;
 varying vec2 uv;
 uniform sampler2D tex;
-uniform vec3 gains;
+uniform vec3 lmsGains;
+uniform vec3 waterDir;
+uniform vec3 tint;
 uniform float exposure;
 uniform float saturation;
 uniform float bypass;
 uniform float fluorKeep;
-uniform vec3 tint;
 uniform float zoom;
+uniform float clarity;
+uniform vec2 texel;
+
+// Bradford cone response sandwich: sRGB-linear <-> LMS (columns!)
+const mat3 RGB2LMS = mat3(
+  0.4227253, 0.0556998, 0.0213826,
+  0.4913453, 0.9615341, 0.0876419,
+  0.0273579, 0.0231838, 0.9805081);
+const mat3 LMS2RGB = mat3(
+  2.5380445, -0.1460041, -0.0422985,
+ -1.2932770,  1.1166483, -0.0716072,
+ -0.0402369, -0.0223290,  1.0227527);
+
+vec3 hable(vec3 x) {
+  const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
 void main() {
   vec2 zuv = (uv - 0.5) / zoom + 0.5;
   vec3 c = texture2D(tex, zuv).rgb;
   vec3 lin = pow(c, vec3(2.2));
-  // Selective correction: pixels colored like the water cast (what the gains
-  // were built to neutralize) get fully corrected; pixels that fluoresce in
-  // their own color (orange clam, purple shroom) keep their emitted color.
-  vec3 water = normalize(vec3(1.0) / max(gains, vec3(1e-3)));
-  float sim = dot(normalize(lin + vec3(1e-4)), water);
+  const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+
+  // Clarity: unsharp mask on luma (gamma-space estimate is fine here).
+  vec2 o = texel * 2.0;
+  float bl = dot(texture2D(tex, zuv + vec2( o.x, 0.0)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2(-o.x, 0.0)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2(0.0,  o.y)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2(0.0, -o.y)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2( o.x,  o.y)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2(-o.x,  o.y)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2( o.x, -o.y)).rgb, LW)
+           + dot(texture2D(tex, zuv + vec2(-o.x, -o.y)).rgb, LW);
+  lin *= max(1.0 + clarity * (dot(c, LW) - bl / 8.0) * 3.0, 0.0);
+
+  // White balance in LMS, then re-aim at the chosen white point.
+  vec3 corrected = max(LMS2RGB * ((RGB2LMS * lin) * lmsGains), 0.0) * tint;
+
+  // Fluorescence protection: pixels colored like the water cast get full
+  // correction; pixels glowing in their own color keep it.
+  float sim = dot(normalize(lin + vec3(1e-4)), waterDir);
   float protect = (1.0 - smoothstep(0.86, 0.99, sim)) * fluorKeep;
-  // gains neutralize the cast; tint re-aims the result at a chosen
-  // white point (T5-ish cool blue instead of flat gray).
-  lin = mix(lin * gains * tint, lin, protect) * exposure;
-  // Soft highlight shoulder: compress bright values instead of hard-clipping.
-  // Hard clamp flattens boosted areas into featureless patches; this keeps
-  // texture (sand, clam mantle) without needing to dial exposure back.
-  vec3 over = step(vec3(0.75), lin);
-  vec3 shoulder = 0.75 + 0.25 * (1.0 - exp(-(lin - 0.75) / 0.25));
-  lin = mix(lin, shoulder, over);
-  float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  lin = mix(corrected, lin, protect) * exposure;
+
+  // Hable filmic curve, normalized to its value at white point 11.2.
+  lin = hable(lin * 2.0) / hable(vec3(11.2));
+
+  float luma = dot(lin, LW);
   // Ease saturation toward neutral in highlights so bright areas stay clean.
   float satEff = mix(saturation, min(saturation, 1.0), smoothstep(0.6, 1.0, luma));
   lin = mix(vec3(luma), lin, satEff);
@@ -185,8 +221,13 @@ varying vec2 uv;
 uniform sampler2D cam;
 uniform sampler2D prev;
 uniform float alpha;
+uniform vec2 shift; // camera drift since last frame, in UV units
 void main() {
-  gl_FragColor = vec4(mix(texture2D(prev, uv).rgb, texture2D(cam, uv).rgb, alpha), 1.0);
+  vec2 puv = uv + shift;
+  // If the aligned sample falls outside the average, take the camera as-is.
+  float inside = step(0.0, puv.x) * step(puv.x, 1.0) * step(0.0, puv.y) * step(puv.y, 1.0);
+  float a = mix(1.0, alpha, inside);
+  gl_FragColor = vec4(mix(texture2D(prev, puv).rgb, texture2D(cam, uv).rgb, a), 1.0);
 }
 `;
 
@@ -203,15 +244,81 @@ document.body.appendChild(video);
 
 const cv = $("cv");
 const gl = cv.getContext("webgl");
-let prog, uGains, uExposure, uSaturation, uBypass, uFluor, uTint, uZoom;
+let prog, uLmsGains, uWaterDir, uExposure, uSaturation, uBypass, uFluor, uTint, uZoom, uClarity, uTexel;
+
+// Bradford: same matrix as the shader, row-major here.
+const RGB2LMS = [
+  [0.4227253, 0.4913453, 0.0273579],
+  [0.0556998, 0.9615341, 0.0231838],
+  [0.0213826, 0.0876419, 0.9805081],
+];
+const mulM = (M, v) => M.map(r => r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
 let camTrack = null, camZoomCaps = null; // native (ISP) zoom if the browser exposes it
 let digitalZoom = 1;
-let blendProg, uAlpha, uCam, uPrev, uTex;
+let blendProg, uAlpha, uCam, uPrev, uShift, uTex;
 let camTex, pingPong = [], pp = 0, firstFrame = true;
 
 // Offscreen 2D canvas used only to sample pixels for tap-to-white-balance.
 const sampleCv = document.createElement("canvas");
 const sampleCtx = sampleCv.getContext("2d", { willReadFrequently: true });
+
+// --- shift registration (handheld stabilization for the denoiser) -----------
+// Estimate global camera drift between consecutive frames on a tiny grayscale
+// thumbnail, so the blend pass can align the running average to the new frame.
+// Astrophotography "lucky imaging", pocket edition: integer-pixel search on a
+// 64x48 luma image (±3px ~ ±60px at full res), refined by parabolic fit.
+const MW = 64, MH = 48;
+const motionCv = document.createElement("canvas");
+motionCv.width = MW; motionCv.height = MH;
+const motionCtx = motionCv.getContext("2d", { willReadFrequently: true });
+let prevLuma = null;
+
+function lumaThumb() {
+  motionCtx.drawImage(video, 0, 0, MW, MH);
+  const d = motionCtx.getImageData(0, 0, MW, MH).data;
+  const out = new Float32Array(MW * MH);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114;
+  }
+  return out;
+}
+
+function sad(a, b, dx, dy) { // sum of absolute differences at integer offset
+  let s = 0, n = 0;
+  const M = 4; // margin
+  for (let y = M; y < MH - M; y += 2) {
+    for (let x = M; x < MW - M; x += 2) {
+      const j = (y + dy) * MW + (x + dx);
+      s += Math.abs(a[y * MW + x] - b[j]);
+      n++;
+    }
+  }
+  return s / n;
+}
+
+function estimateShift() { // returns [dx, dy] in thumbnail pixels, or null
+  const cur = lumaThumb();
+  if (!prevLuma) { prevLuma = cur; return null; }
+  const R = 3;
+  let best = Infinity, bx = 0, by = 0;
+  const costs = {};
+  for (let dy = -R; dy <= R; dy++) {
+    for (let dx = -R; dx <= R; dx++) {
+      const c = sad(cur, prevLuma, dx, dy);
+      costs[dx + "," + dy] = c;
+      if (c < best) { best = c; bx = dx; by = dy; }
+    }
+  }
+  prevLuma = cur;
+  if (Math.abs(bx) === R || Math.abs(by) === R) return null; // hit the edge: motion too big, don't trust
+  // Sub-pixel refinement: parabolic fit through the cost neighborhood.
+  const cN = costs[bx + "," + (by - 1)], cS = costs[bx + "," + (by + 1)];
+  const cW = costs[(bx - 1) + "," + by], cE = costs[(bx + 1) + "," + by];
+  const c0 = costs[bx + "," + by];
+  const fx = (cW - cE) / (2 * (cW - 2 * c0 + cE) || 1);
+  const fy = (cN - cS) / (2 * (cN - 2 * c0 + cS) || 1);
+  return [bx + (isFinite(fx) ? fx : 0), by + (isFinite(fy) ? fy : 0)];
+}
 
 let wbGains = [1, 1, 1];   // computed from tap or preset, before strength lerp
 let comparing = false;
@@ -276,17 +383,21 @@ function initGL() {
   gl.getExtension("OES_texture_half_float_linear");
   accumType = halfFloat ? halfFloat.HALF_FLOAT_OES : gl.UNSIGNED_BYTE;
 
-  uGains = gl.getUniformLocation(prog, "gains");
+  uLmsGains = gl.getUniformLocation(prog, "lmsGains");
+  uWaterDir = gl.getUniformLocation(prog, "waterDir");
   uExposure = gl.getUniformLocation(prog, "exposure");
   uSaturation = gl.getUniformLocation(prog, "saturation");
   uBypass = gl.getUniformLocation(prog, "bypass");
   uFluor = gl.getUniformLocation(prog, "fluorKeep");
   uTint = gl.getUniformLocation(prog, "tint");
   uZoom = gl.getUniformLocation(prog, "zoom");
+  uClarity = gl.getUniformLocation(prog, "clarity");
+  uTexel = gl.getUniformLocation(prog, "texel");
   uTex = gl.getUniformLocation(prog, "tex");
   uAlpha = gl.getUniformLocation(blendProg, "alpha");
   uCam = gl.getUniformLocation(blendProg, "cam");
   uPrev = gl.getUniformLocation(blendProg, "prev");
+  uShift = gl.getUniformLocation(blendProg, "shift");
 }
 
 function setupAccum(w, h) {
@@ -307,7 +418,17 @@ function setUniforms() {
   const manual = [$("red").value / 100, 1, $("blue").value / 100];
   const t = $("strength").value / 100;
   const g = wbGains.map((v, i) => 1 + (v * manual[i] - 1) * t);
-  gl.uniform3f(uGains, g[0], g[1], g[2]);
+  // Bradford: the gains describe "scale the cast to neutral" in RGB; the
+  // equivalent LMS gains are cone responses of target white over cast.
+  const cast = mulM(RGB2LMS, [1 / g[0], 1 / g[1], 1 / g[2]]);
+  const white = mulM(RGB2LMS, [1, 1, 1]);
+  gl.uniform3f(uLmsGains, white[0] / cast[0], white[1] / cast[1], white[2] / cast[2]);
+  // Water-cast direction for fluorescence protection (unit vector).
+  const w = [1 / g[0], 1 / g[1], 1 / g[2]];
+  const wl = Math.hypot(...w);
+  gl.uniform3f(uWaterDir, w[0] / wl, w[1] / wl, w[2] / wl);
+  gl.uniform1f(uClarity, $("clarity").value / 100);
+  gl.uniform2f(uTexel, 1 / cv.width, 1 / cv.height);
   // Tone: target white point from neutral (0) to deep actinic blue (100).
   // Mid-range ≈ cool T5 blue-white. Luma-normalized so brightness holds.
   const k = $("tone").value / 100;
@@ -340,14 +461,30 @@ function draw() {
   // Denoise slider maps to blend alpha: 0 -> alpha 1 (no averaging),
   // 100 -> alpha 1/16 (~16-frame average). First frame seeds the buffer.
   const denoise = $("denoise").value / 100;
-  const alpha = firstFrame ? 1.0 : 1.0 / (1.0 + denoise * 15.0);
+  let alpha = firstFrame ? 1.0 : 1.0 / (1.0 + denoise * 15.0);
   firstFrame = false;
+
+  // Align the running average to the new frame (handheld drift compensation).
+  // Estimated on a small luma thumbnail; null means motion too large to track,
+  // so restart the average rather than smear.
+  let shiftX = 0, shiftY = 0;
+  if (denoise > 0) {
+    const sh = estimateShift();
+    if (sh) {
+      shiftX = sh[0] / MW;
+      shiftY = -sh[1] / MH; // texture y is flipped relative to video
+    } else if (prevLuma) {
+      alpha = 1.0; // untrackable motion: reseed the average with this frame
+    }
+  }
+
   const src = pingPong[pp], dst = pingPong[1 - pp];
   pp = 1 - pp;
   gl.useProgram(blendProg);
   gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
   gl.viewport(0, 0, cv.width, cv.height);
   gl.uniform1f(uAlpha, alpha);
+  gl.uniform2f(uShift, shiftX, shiftY);
   gl.uniform1i(uCam, 0);
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D, src.tex);
@@ -541,19 +678,23 @@ for (const [btnId, boxId] of SHELVES) {
   };
 }
 
-// Presets: starting points tuned per look; tap-WB after picking one refines it.
-// [wbGains, tone, fluor, saturation]
+// Presets are named for the LIGHTING YOU'RE LOOKING AT; each applies the
+// correction that makes the photo match what your adapted eye sees under it.
+// Bluer light -> stronger correction, but keep some blue mood (the eye never
+// fully adapts) and protect fluorescence, which the eye sees vividly.
+// [wbGains, tone, fluor, saturation, clarity]
 const PRESETS = {
-  t5:       [[2.6, 1.0, 0.55], 35, 50, 110],
-  glow:     [[1.8, 1.0, 0.75], 65, 90, 120],
-  daylight: [[3.2, 1.0, 0.45],  0, 25, 100],
-  windex:   [[1.3, 1.0, 0.90], 90, 70, 110],
+  windex:  [[3.2, 1.0, 0.45], 45, 85, 105, 20],  // heavy blue: strong fix, keep glow
+  actinic: [[2.2, 1.0, 0.60], 55, 90, 110, 15],  // fluorescence is the subject
+  mixed:   [[2.4, 1.0, 0.60], 35, 55, 105, 25],  // your tank: T5-ish middle ground
+  white:   [[1.5, 1.0, 0.85], 15, 30, 100, 30],  // near-daylight: gentle nudge
 };
-for (const btn of document.querySelectorAll("#presets button")) {
+for (const btn of document.querySelectorAll("#presets button[data-preset]")) {
   btn.onclick = () => {
-    const [g, tone, fluor, sat] = PRESETS[btn.dataset.preset];
+    const [g, tone, fluor, sat, clar] = PRESETS[btn.dataset.preset];
     wbGains = g.slice();
     $("tone").value = tone; $("fluor").value = fluor; $("saturation").value = sat;
+    $("clarity").value = clar;
     $("red").value = 100; $("blue").value = 100; $("strength").value = 100;
     $("hint").style.opacity = 0;
   };
@@ -562,7 +703,7 @@ for (const btn of document.querySelectorAll("#presets button")) {
 $("reset").onclick = () => {
   wbGains = [1, 1, 1];
   $("red").value = 100; $("blue").value = 100; $("denoise").value = 60; $("fluor").value = 50;
-  $("tone").value = 35;
+  $("tone").value = 35; $("clarity").value = 25;
   $("strength").value = 100; $("exposure").value = 0; $("saturation").value = 100;
   $("hint").style.opacity = 1;
 };
