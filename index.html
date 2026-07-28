@@ -124,8 +124,10 @@ uniform float saturation;
 uniform float bypass;
 uniform float fluorKeep;
 uniform vec3 tint;
+uniform float zoom;
 void main() {
-  vec3 c = texture2D(tex, uv).rgb;
+  vec2 zuv = (uv - 0.5) / zoom + 0.5;
+  vec3 c = texture2D(tex, zuv).rgb;
   vec3 lin = pow(c, vec3(2.2));
   // Selective correction: pixels colored like the water cast (what the gains
   // were built to neutralize) get fully corrected; pixels that fluoresce in
@@ -170,7 +172,9 @@ document.body.appendChild(video);
 
 const cv = $("cv");
 const gl = cv.getContext("webgl");
-let prog, uGains, uExposure, uSaturation, uBypass, uFluor, uTint;
+let prog, uGains, uExposure, uSaturation, uBypass, uFluor, uTint, uZoom;
+let camTrack = null, camZoomCaps = null; // native (ISP) zoom if the browser exposes it
+let digitalZoom = 1;
 let blendProg, uAlpha, uCam, uPrev, uTex;
 let camTex, pingPong = [], pp = 0, firstFrame = true;
 
@@ -247,6 +251,7 @@ function initGL() {
   uBypass = gl.getUniformLocation(prog, "bypass");
   uFluor = gl.getUniformLocation(prog, "fluorKeep");
   uTint = gl.getUniformLocation(prog, "tint");
+  uZoom = gl.getUniformLocation(prog, "zoom");
   uTex = gl.getUniformLocation(prog, "tex");
   uAlpha = gl.getUniformLocation(blendProg, "alpha");
   uCam = gl.getUniformLocation(blendProg, "cam");
@@ -278,6 +283,7 @@ function setUniforms() {
   gl.uniform3f(uTint, tint[0], tint[1], tint[2]);
   gl.uniform1f(uExposure, Math.pow(2, $("exposure").value / 50));
   gl.uniform1f(uFluor, $("fluor").value / 100);
+  gl.uniform1f(uZoom, digitalZoom);
   gl.uniform1f(uSaturation, $("saturation").value / 100);
   gl.uniform1f(uBypass, comparing ? 1 : 0);
 }
@@ -341,12 +347,62 @@ function startLoop() {
   }
 }
 
-// --- tap to white-balance -------------------------------------------------
+// --- pinch zoom + tap to white-balance --------------------------------------
+// One pointer = tap-WB (on release, if it never became a pinch).
+// Two pointers = pinch zoom: native camera zoom when the browser exposes it,
+// shader (digital) zoom otherwise.
+const pointers = new Map();
+let pinchStartDist = 0, pinchStartZoom = 1, wasPinch = false;
+
+function currentZoom() {
+  return camZoomCaps ? (camTrack.getSettings().zoom || 1) : digitalZoom;
+}
+function setZoom(z) {
+  if (camZoomCaps) {
+    z = Math.min(camZoomCaps.max, Math.max(camZoomCaps.min, z));
+    camTrack.applyConstraints({ advanced: [{ zoom: z }] }).catch(() => {});
+  } else {
+    digitalZoom = Math.min(8, Math.max(1, z));
+  }
+  $("res").textContent = cv.width + "×" + cv.height + "  " + z.toFixed(1) + "×";
+}
+
 cv.addEventListener("pointerdown", e => {
+  pointers.set(e.pointerId, e);
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    pinchStartDist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    pinchStartZoom = currentZoom();
+    wasPinch = true;
+  } else if (pointers.size === 1) {
+    wasPinch = false;
+  }
+});
+cv.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, e);
+  if (pointers.size === 2 && pinchStartDist > 0) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    setZoom(pinchStartZoom * d / pinchStartDist);
+  }
+});
+const endPointer = e => { pointers.delete(e.pointerId); };
+cv.addEventListener("pointercancel", endPointer);
+cv.addEventListener("pointerup", e => {
+  endPointer(e);
+  if (!wasPinch) tapWB(e);
+});
+
+function tapWB(e) {
   if (video.readyState < 2) return;
   const r = cv.getBoundingClientRect();
-  const x = Math.round((e.clientX - r.left) / r.width * video.videoWidth);
-  const y = Math.round((e.clientY - r.top) / r.height * video.videoHeight);
+  // Map through digital zoom: the visible frame is a center crop of the video.
+  let u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+  u = (u - 0.5) / digitalZoom + 0.5;
+  v = (v - 0.5) / digitalZoom + 0.5;
+  const x = Math.round(u * video.videoWidth);
+  const y = Math.round(v * video.videoHeight);
 
   // Average a small patch of the *raw* video around the tap point.
   const N = 12;
@@ -367,7 +423,7 @@ cv.addEventListener("pointerdown", e => {
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
   wbGains = [clamp(gs / Math.max(rs, 1e-4), 0.25, 12), 1, clamp(gs / Math.max(bs, 1e-4), 0.25, 12)];
   $("hint").style.opacity = 0;
-});
+}
 
 // --- controls ---------------------------------------------------------------
 // Sliders start collapsed; 🎚 toggles them.
@@ -431,6 +487,9 @@ $("startBtn").onclick = async () => {
     // Torch is only exposed by some browsers (Chrome/Android). Feature-detect;
     // Safari/iOS does not implement it, so the button stays hidden there.
     const track = stream.getVideoTracks()[0];
+    camTrack = track;
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.zoom && caps.zoom.max > caps.zoom.min) camZoomCaps = caps.zoom;
     if (track.getCapabilities && track.getCapabilities().torch) {
       const btn = $("torch");
       btn.hidden = false;
