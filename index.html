@@ -417,7 +417,7 @@ function setupAccum(w, h) {
 function setUniforms() {
   // Manual sliders multiply on top of tap/preset white balance.
   // Tint: green (+) <-> magenta (-), the WB axis orthogonal to temperature.
-  const gm = Math.pow(2, $("tintGM").value / 200); // ±0.5 stop of green
+  const gm = Math.pow(2, $("tintGM").value / 110); // ~±0.9 stop of green
   const manual = [$("red").value / 100, gm, $("blue").value / 100];
   const t = $("strength").value / 100;
   const g = wbGains.map((v, i) => 1 + (v * manual[i] - 1) * t);
