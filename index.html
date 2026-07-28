@@ -24,9 +24,15 @@
     background: linear-gradient(transparent, rgba(0,0,0,0.75) 30%);
     display: flex; flex-direction: column; gap: 8px;
   }
-  #sliders { display: flex; flex-direction: column; gap: 8px; }
-  #sliders.collapsed { display: none; }
-  #tune.active { background: rgba(255,144,64,0.45); }
+  #sliders, #camCtl { display: flex; flex-direction: column; gap: 8px; }
+  #sliders.collapsed, #camCtl.collapsed { display: none; }
+  #camCtl { max-height: 40vh; overflow-y: auto; }
+  #camCtl .row label { width: 92px; }
+  #camCtl select {
+    flex: 1; background: rgba(255,255,255,0.14); color: #eee;
+    border: none; border-radius: 6px; padding: 6px;
+  }
+  #tune.active, #camBtn.active { background: rgba(255,144,64,0.45); }
   .row { display: flex; align-items: center; gap: 10px; }
   .row label { font-size: 12px; width: 62px; color: #bbb; flex-shrink: 0; }
   input[type=range] { flex: 1; accent-color: #ff9040; }
@@ -83,8 +89,10 @@
     <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
     <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
   </div>
+  <div id="camCtl" class="collapsed"></div>
   <div class="buttons">
     <button id="tune">🎚</button>
+    <button id="camBtn" hidden>📷</button>
     <button id="reset">Reset</button>
     <button id="torch" hidden>🔦</button>
     <button id="preset">Reef preset</button>
@@ -426,11 +434,80 @@ function tapWB(e) {
 }
 
 // --- controls ---------------------------------------------------------------
+// --- advanced camera controls ------------------------------------------------
+// Enumerate everything getCapabilities() reports and build a control per
+// feature: range -> slider, enum -> dropdown, boolean -> toggle. Whatever
+// this WebKit exposes shows up automatically.
+const CAM_SKIP = new Set(["width", "height", "aspectRatio", "frameRate",
+  "facingMode", "deviceId", "groupId", "resizeMode", "zoom", "torch"]);
+
+function buildCamControls(track) {
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  const settings = track.getSettings ? track.getSettings() : {};
+  const box = $("camCtl");
+  box.innerHTML = "";
+  let count = 0;
+
+  const apply = (name, value) => {
+    track.applyConstraints({ advanced: [{ [name]: value }] }).catch(() => {});
+  };
+
+  for (const [name, cap] of Object.entries(caps)) {
+    if (CAM_SKIP.has(name)) continue;
+    const row = document.createElement("div");
+    row.className = "row";
+    const label = document.createElement("label");
+    label.textContent = name.replace(/([A-Z])/g, " $1").toLowerCase();
+    row.appendChild(label);
+
+    if (Array.isArray(cap) && cap.length > 1) {           // enum (e.g. whiteBalanceMode)
+      const sel = document.createElement("select");
+      for (const v of cap) {
+        const o = document.createElement("option");
+        o.value = o.textContent = v;
+        if (settings[name] === v) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.onchange = () => apply(name, sel.value);
+      row.appendChild(sel);
+    } else if (cap && typeof cap === "object" && "min" in cap && cap.max > cap.min) {  // range
+      const inp = document.createElement("input");
+      inp.type = "range";
+      inp.min = cap.min; inp.max = cap.max;
+      inp.step = cap.step || (cap.max - cap.min) / 100;
+      inp.value = settings[name] ?? (cap.min + cap.max) / 2;
+      inp.oninput = () => apply(name, parseFloat(inp.value));
+      row.appendChild(inp);
+    } else if (Array.isArray(cap) && cap.length === 1 && typeof cap[0] === "boolean" || cap === true) {
+      const btn = document.createElement("button");
+      let on = !!settings[name];
+      btn.textContent = on ? "on" : "off";
+      btn.onclick = () => { on = !on; btn.textContent = on ? "on" : "off"; apply(name, on); };
+      row.appendChild(btn);
+    } else {
+      continue;
+    }
+    box.appendChild(row);
+    count++;
+  }
+
+  if (count > 0) {
+    const btn = $("camBtn");
+    btn.hidden = false;
+    btn.onclick = () => {
+      const open = !box.classList.toggle("collapsed");
+      btn.classList.toggle("active", open);
+      if (open) { $("sliders").classList.add("collapsed"); $("tune").classList.remove("active"); }
+    };
+  }
+}
+
 // Sliders start collapsed; 🎚 toggles them.
 $("sliders").classList.add("collapsed");
 $("tune").onclick = () => {
   const open = !$("sliders").classList.toggle("collapsed");
   $("tune").classList.toggle("active", open);
+  if (open) { $("camCtl").classList.add("collapsed"); $("camBtn").classList.remove("active"); }
 };
 
 $("reset").onclick = () => {
@@ -490,6 +567,7 @@ $("startBtn").onclick = async () => {
     camTrack = track;
     const caps = track.getCapabilities ? track.getCapabilities() : {};
     if (caps.zoom && caps.zoom.max > caps.zoom.min) camZoomCaps = caps.zoom;
+    buildCamControls(track);
     if (track.getCapabilities && track.getCapabilities().torch) {
       const btn = $("torch");
       btn.hidden = false;
