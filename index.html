@@ -63,6 +63,8 @@
 <div id="hint">Tap something white/gray in the tank to color-correct</div>
 
 <div id="panel" hidden>
+  <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
+  <div class="row"><label>Blue cut</label><input type="range" id="blue" min="20" max="100" value="100"></div>
   <div class="row"><label>Strength</label><input type="range" id="strength" min="0" max="100" value="100"></div>
   <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
   <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
@@ -107,9 +109,16 @@ void main() {
 }
 `;
 
+// iOS Safari won't decode frames from a video element that isn't in the DOM,
+// so keep it attached but invisible (display:none also stops decoding).
 const video = document.createElement("video");
 video.setAttribute("playsinline", "");
+video.setAttribute("webkit-playsinline", "");
+video.setAttribute("muted", "");
+video.setAttribute("autoplay", "");
 video.muted = true;
+video.style.cssText = "position:fixed;top:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;";
+document.body.appendChild(video);
 
 const cv = $("cv");
 const gl = cv.getContext("webgl", { preserveDrawingBuffer: true });
@@ -161,8 +170,10 @@ function initGL() {
 }
 
 function setUniforms() {
+  // Manual sliders multiply on top of tap/preset white balance.
+  const manual = [$("red").value / 100, 1, $("blue").value / 100];
   const t = $("strength").value / 100;
-  const g = wbGains.map(v => 1 + (v - 1) * t);
+  const g = wbGains.map((v, i) => 1 + (v * manual[i] - 1) * t);
   gl.uniform3f(uGains, g[0], g[1], g[2]);
   gl.uniform1f(uExposure, Math.pow(2, $("exposure").value / 50));
   gl.uniform1f(uSaturation, $("saturation").value / 100);
@@ -176,7 +187,7 @@ function frame() {
       cv.height = video.videoHeight;
       gl.viewport(0, 0, cv.width, cv.height);
     }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
     setUniforms();
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
@@ -214,6 +225,7 @@ cv.addEventListener("pointerdown", e => {
 // --- controls ---------------------------------------------------------------
 $("reset").onclick = () => {
   wbGains = [1, 1, 1];
+  $("red").value = 100; $("blue").value = 100;
   $("strength").value = 100; $("exposure").value = 0; $("saturation").value = 100;
   $("hint").style.opacity = 1;
 };
@@ -259,6 +271,10 @@ $("startBtn").onclick = async () => {
     });
     video.srcObject = stream;
     await video.play();
+    // Wait until real frame dimensions are known before first draw.
+    if (!video.videoWidth) {
+      await new Promise(res => video.addEventListener("loadedmetadata", res, { once: true }));
+    }
     initGL();
     $("start").hidden = true;
     $("panel").hidden = false;
