@@ -78,6 +78,7 @@
   <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
   <div class="buttons">
     <button id="reset">Reset</button>
+    <button id="torch" hidden>🔦</button>
     <button id="preset">Reef preset</button>
     <button id="shutter" aria-label="Take photo"></button>
     <button id="compare">Hold: original</button>
@@ -391,6 +392,19 @@ $("startBtn").onclick = async () => {
       audio: false,
     });
     video.srcObject = stream;
+    // Torch is only exposed by some browsers (Chrome/Android). Feature-detect;
+    // Safari/iOS does not implement it, so the button stays hidden there.
+    const track = stream.getVideoTracks()[0];
+    if (track.getCapabilities && track.getCapabilities().torch) {
+      const btn = $("torch");
+      btn.hidden = false;
+      let on = false;
+      btn.onclick = async () => {
+        on = !on;
+        await track.applyConstraints({ advanced: [{ torch: on }] });
+        btn.style.background = on ? "#b58900" : "";
+      };
+    }
     await video.play();
     // Wait until real frame dimensions are known before first draw.
     if (!video.videoWidth) {
