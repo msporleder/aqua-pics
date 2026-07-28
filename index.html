@@ -434,8 +434,10 @@ function setUniforms() {
   gl.uniform2f(uTexel, 1 / cv.width, 1 / cv.height);
   // Tone: target white point from neutral (0) to deep actinic blue (100).
   // Mid-range ≈ cool T5 blue-white. Luma-normalized so brightness holds.
+  // Green must fall much slower than red or the path detours through
+  // magenta/purple; real blue tank light is cyan-leaning.
   const k = $("tone").value / 100;
-  let tint = [1 - 0.35 * k, 1 - 0.12 * k, 1 + 0.9 * k * k];
+  let tint = [1 - 0.35 * k, 1 - 0.04 * k, 1 + 0.9 * k * k];
   const luma = 0.2126 * tint[0] + 0.7152 * tint[1] + 0.0722 * tint[2];
   tint = tint.map(v => v / luma);
   gl.uniform3f(uTint, tint[0], tint[1], tint[2]);
