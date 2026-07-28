@@ -300,7 +300,7 @@ function sad(a, b, dx, dy) { // sum of absolute differences at integer offset
 function estimateShift() { // returns [dx, dy] in thumbnail pixels, or null
   const cur = lumaThumb();
   if (!prevLuma) { prevLuma = cur; return null; }
-  const R = 3;
+  const R = 5; // ±5 thumb px ≈ ±100 full-res px between frames
   let best = Infinity, bx = 0, by = 0;
   const costs = {};
   for (let dy = -R; dy <= R; dy++) {
