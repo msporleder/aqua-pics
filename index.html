@@ -48,6 +48,11 @@
   #start p { color: #9ab; font-size: 14px; max-width: 320px; line-height: 1.5; }
   #start button { background: #1a6fb0; padding: 14px 28px; font-size: 17px; border-radius: 12px; }
   #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity 0.25s; }
+  #res {
+    position: fixed; top: env(safe-area-inset-top, 8px); right: 8px;
+    font-size: 11px; color: rgba(255,255,255,0.55); text-shadow: 0 1px 2px #000;
+    pointer-events: none;
+  }
   #err { color: #f88; font-size: 13px; max-width: 320px; }
 </style>
 </head>
@@ -62,6 +67,7 @@
 
 <div id="stage"><canvas id="cv"></canvas></div>
 <div id="hint">Tap something white/gray in the tank to color-correct</div>
+<div id="res"></div>
 
 <div id="panel" hidden>
   <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
@@ -99,7 +105,7 @@ void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }
 // White balance is applied in (approximately) linear light: decode sRGB,
 // apply per-channel gains + exposure, adjust saturation, re-encode.
 const FS = `
-precision mediump float;
+precision highp float;
 varying vec2 uv;
 uniform sampler2D tex;
 uniform vec3 gains;
@@ -129,7 +135,7 @@ video.style.cssText = "position:fixed;top:0;left:0;width:2px;height:2px;opacity:
 document.body.appendChild(video);
 
 const cv = $("cv");
-const gl = cv.getContext("webgl", { preserveDrawingBuffer: true });
+const gl = cv.getContext("webgl");
 let prog, uGains, uExposure, uSaturation, uBypass;
 
 // Offscreen 2D canvas used only to sample pixels for tap-to-white-balance.
@@ -188,18 +194,33 @@ function setUniforms() {
   gl.uniform1f(uBypass, comparing ? 1 : 0);
 }
 
-function frame() {
-  if (video.readyState >= 2) {
-    if (cv.width !== video.videoWidth) {
-      cv.width = video.videoWidth;
-      cv.height = video.videoHeight;
-      gl.viewport(0, 0, cv.width, cv.height);
-    }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-    setUniforms();
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+function draw() {
+  if (video.readyState < 2) return;
+  if (cv.width !== video.videoWidth) {
+    cv.width = video.videoWidth;
+    cv.height = video.videoHeight;
+    gl.viewport(0, 0, cv.width, cv.height);
+    $("res").textContent = cv.width + "×" + cv.height;
   }
-  requestAnimationFrame(frame);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  setUniforms();
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Redraw only when the camera delivers a new frame (~30fps) instead of on
+// every display refresh (up to 120Hz) — much less GPU work and heat.
+function startLoop() {
+  if ("requestVideoFrameCallback" in video) {
+    const tick = () => { draw(); video.requestVideoFrameCallback(tick); };
+    video.requestVideoFrameCallback(tick);
+  } else {
+    let lastTime = -1;
+    const tick = () => {
+      if (video.currentTime !== lastTime) { lastTime = video.currentTime; draw(); }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
 }
 
 // --- tap to white-balance -------------------------------------------------
@@ -251,6 +272,9 @@ $("shutter").onclick = async () => {
   const flash = $("flash");
   flash.style.opacity = 0.8;
   setTimeout(() => flash.style.opacity = 0, 120);
+  // Without preserveDrawingBuffer the GL buffer is cleared after compositing,
+  // so redraw immediately before reading the canvas.
+  draw();
   const blob = await new Promise(res => cv.toBlob(res, "image/jpeg", 0.92));
   if (!blob) return;
   const file = new File([blob], "aqua-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg",
@@ -286,7 +310,7 @@ $("startBtn").onclick = async () => {
     initGL();
     $("start").hidden = true;
     $("panel").hidden = false;
-    requestAnimationFrame(frame);
+    startLoop();
   } catch (e) {
     $("err").textContent = e.name === "NotAllowedError"
       ? "Camera permission denied. Enable it in Settings → Safari → Camera."
