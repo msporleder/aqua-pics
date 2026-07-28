@@ -24,6 +24,9 @@
     background: linear-gradient(transparent, rgba(0,0,0,0.75) 30%);
     display: flex; flex-direction: column; gap: 8px;
   }
+  #sliders { display: flex; flex-direction: column; gap: 8px; }
+  #sliders.collapsed { display: none; }
+  #tune.active { background: rgba(255,144,64,0.45); }
   .row { display: flex; align-items: center; gap: 10px; }
   .row label { font-size: 12px; width: 62px; color: #bbb; flex-shrink: 0; }
   input[type=range] { flex: 1; accent-color: #ff9040; }
@@ -70,13 +73,17 @@
 <div id="res"></div>
 
 <div id="panel" hidden>
-  <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
-  <div class="row"><label>Blue cut</label><input type="range" id="blue" min="20" max="100" value="100"></div>
-  <div class="row"><label>Denoise</label><input type="range" id="denoise" min="0" max="100" value="60"></div>
-  <div class="row"><label>Strength</label><input type="range" id="strength" min="0" max="100" value="100"></div>
-  <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
-  <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
+  <div id="sliders">
+    <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
+    <div class="row"><label>Blue cut</label><input type="range" id="blue" min="20" max="100" value="100"></div>
+    <div class="row"><label>Fluor keep</label><input type="range" id="fluor" min="0" max="100" value="50"></div>
+    <div class="row"><label>Denoise</label><input type="range" id="denoise" min="0" max="100" value="60"></div>
+    <div class="row"><label>Strength</label><input type="range" id="strength" min="0" max="100" value="100"></div>
+    <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
+    <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
+  </div>
   <div class="buttons">
+    <button id="tune">🎚</button>
     <button id="reset">Reset</button>
     <button id="torch" hidden>🔦</button>
     <button id="preset">Reef preset</button>
@@ -114,10 +121,17 @@ uniform vec3 gains;
 uniform float exposure;
 uniform float saturation;
 uniform float bypass;
+uniform float fluorKeep;
 void main() {
   vec3 c = texture2D(tex, uv).rgb;
   vec3 lin = pow(c, vec3(2.2));
-  lin *= gains * exposure;
+  // Selective correction: pixels colored like the water cast (what the gains
+  // were built to neutralize) get fully corrected; pixels that fluoresce in
+  // their own color (orange clam, purple shroom) keep their emitted color.
+  vec3 water = normalize(vec3(1.0) / max(gains, vec3(1e-3)));
+  float sim = dot(normalize(lin + vec3(1e-4)), water);
+  float protect = (1.0 - smoothstep(0.86, 0.99, sim)) * fluorKeep;
+  lin = mix(lin * gains, lin, protect) * exposure;
   float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
   lin = mix(vec3(luma), lin, saturation);
   vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
@@ -152,7 +166,7 @@ document.body.appendChild(video);
 
 const cv = $("cv");
 const gl = cv.getContext("webgl");
-let prog, uGains, uExposure, uSaturation, uBypass;
+let prog, uGains, uExposure, uSaturation, uBypass, uFluor;
 let blendProg, uAlpha, uCam, uPrev, uTex;
 let camTex, pingPong = [], pp = 0, firstFrame = true;
 
@@ -227,6 +241,7 @@ function initGL() {
   uExposure = gl.getUniformLocation(prog, "exposure");
   uSaturation = gl.getUniformLocation(prog, "saturation");
   uBypass = gl.getUniformLocation(prog, "bypass");
+  uFluor = gl.getUniformLocation(prog, "fluorKeep");
   uTex = gl.getUniformLocation(prog, "tex");
   uAlpha = gl.getUniformLocation(blendProg, "alpha");
   uCam = gl.getUniformLocation(blendProg, "cam");
@@ -250,6 +265,7 @@ function setUniforms() {
   const g = wbGains.map((v, i) => 1 + (v * manual[i] - 1) * t);
   gl.uniform3f(uGains, g[0], g[1], g[2]);
   gl.uniform1f(uExposure, Math.pow(2, $("exposure").value / 50));
+  gl.uniform1f(uFluor, $("fluor").value / 100);
   gl.uniform1f(uSaturation, $("saturation").value / 100);
   gl.uniform1f(uBypass, comparing ? 1 : 0);
 }
@@ -342,9 +358,16 @@ cv.addEventListener("pointerdown", e => {
 });
 
 // --- controls ---------------------------------------------------------------
+// Sliders start collapsed; 🎚 toggles them.
+$("sliders").classList.add("collapsed");
+$("tune").onclick = () => {
+  const open = !$("sliders").classList.toggle("collapsed");
+  $("tune").classList.toggle("active", open);
+};
+
 $("reset").onclick = () => {
   wbGains = [1, 1, 1];
-  $("red").value = 100; $("blue").value = 100; $("denoise").value = 60;
+  $("red").value = 100; $("blue").value = 100; $("denoise").value = 60; $("fluor").value = 50;
   $("strength").value = 100; $("exposure").value = 0; $("saturation").value = 100;
   $("hint").style.opacity = 1;
 };
