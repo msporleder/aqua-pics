@@ -74,6 +74,7 @@
 
 <div id="panel" hidden>
   <div id="sliders">
+    <div class="row"><label>Tone</label><input type="range" id="tone" min="0" max="100" value="35"></div>
     <div class="row"><label>Red boost</label><input type="range" id="red" min="100" max="500" value="100"></div>
     <div class="row"><label>Blue cut</label><input type="range" id="blue" min="20" max="100" value="100"></div>
     <div class="row"><label>Fluor keep</label><input type="range" id="fluor" min="0" max="100" value="50"></div>
@@ -122,6 +123,7 @@ uniform float exposure;
 uniform float saturation;
 uniform float bypass;
 uniform float fluorKeep;
+uniform vec3 tint;
 void main() {
   vec3 c = texture2D(tex, uv).rgb;
   vec3 lin = pow(c, vec3(2.2));
@@ -131,7 +133,9 @@ void main() {
   vec3 water = normalize(vec3(1.0) / max(gains, vec3(1e-3)));
   float sim = dot(normalize(lin + vec3(1e-4)), water);
   float protect = (1.0 - smoothstep(0.86, 0.99, sim)) * fluorKeep;
-  lin = mix(lin * gains, lin, protect) * exposure;
+  // gains neutralize the cast; tint re-aims the result at a chosen
+  // white point (T5-ish cool blue instead of flat gray).
+  lin = mix(lin * gains * tint, lin, protect) * exposure;
   float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
   lin = mix(vec3(luma), lin, saturation);
   vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
@@ -166,7 +170,7 @@ document.body.appendChild(video);
 
 const cv = $("cv");
 const gl = cv.getContext("webgl");
-let prog, uGains, uExposure, uSaturation, uBypass, uFluor;
+let prog, uGains, uExposure, uSaturation, uBypass, uFluor, uTint;
 let blendProg, uAlpha, uCam, uPrev, uTex;
 let camTex, pingPong = [], pp = 0, firstFrame = true;
 
@@ -242,6 +246,7 @@ function initGL() {
   uSaturation = gl.getUniformLocation(prog, "saturation");
   uBypass = gl.getUniformLocation(prog, "bypass");
   uFluor = gl.getUniformLocation(prog, "fluorKeep");
+  uTint = gl.getUniformLocation(prog, "tint");
   uTex = gl.getUniformLocation(prog, "tex");
   uAlpha = gl.getUniformLocation(blendProg, "alpha");
   uCam = gl.getUniformLocation(blendProg, "cam");
@@ -264,6 +269,13 @@ function setUniforms() {
   const t = $("strength").value / 100;
   const g = wbGains.map((v, i) => 1 + (v * manual[i] - 1) * t);
   gl.uniform3f(uGains, g[0], g[1], g[2]);
+  // Tone: target white point from neutral (0) to deep actinic blue (100).
+  // Mid-range ≈ cool T5 blue-white. Luma-normalized so brightness holds.
+  const k = $("tone").value / 100;
+  let tint = [1 - 0.35 * k, 1 - 0.12 * k, 1 + 0.9 * k * k];
+  const luma = 0.2126 * tint[0] + 0.7152 * tint[1] + 0.0722 * tint[2];
+  tint = tint.map(v => v / luma);
+  gl.uniform3f(uTint, tint[0], tint[1], tint[2]);
   gl.uniform1f(uExposure, Math.pow(2, $("exposure").value / 50));
   gl.uniform1f(uFluor, $("fluor").value / 100);
   gl.uniform1f(uSaturation, $("saturation").value / 100);
@@ -368,6 +380,7 @@ $("tune").onclick = () => {
 $("reset").onclick = () => {
   wbGains = [1, 1, 1];
   $("red").value = 100; $("blue").value = 100; $("denoise").value = 60; $("fluor").value = 50;
+  $("tone").value = 35;
   $("strength").value = 100; $("exposure").value = 0; $("saturation").value = 100;
   $("hint").style.opacity = 1;
 };
