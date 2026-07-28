@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>aqua-pics</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; background: #000; color: #eee; font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { max-width: 100%; max-height: 100%; touch-action: none; }
+  #hint {
+    position: fixed; top: env(safe-area-inset-top, 12px); left: 0; right: 0;
+    text-align: center; font-size: 14px; padding: 10px;
+    color: #fff; text-shadow: 0 1px 3px #000; pointer-events: none;
+    transition: opacity 0.5s;
+  }
+  #panel {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 10px 16px calc(env(safe-area-inset-bottom, 12px) + 10px);
+    background: linear-gradient(transparent, rgba(0,0,0,0.75) 30%);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .row label { font-size: 12px; width: 62px; color: #bbb; flex-shrink: 0; }
+  input[type=range] { flex: 1; accent-color: #ff9040; }
+  .buttons { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+  button {
+    background: rgba(255,255,255,0.14); color: #eee; border: none;
+    border-radius: 10px; padding: 10px 14px; font-size: 14px; font-weight: 600;
+  }
+  button:active { background: rgba(255,255,255,0.3); }
+  #shutter {
+    width: 66px; height: 66px; border-radius: 50%;
+    background: #fff; border: 4px solid rgba(255,255,255,0.4);
+    background-clip: content-box; padding: 3px;
+  }
+  #shutter:active { background-color: #ccc; }
+  #start {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: #05121f; z-index: 10; padding: 24px; text-align: center;
+  }
+  #start h1 { font-size: 22px; }
+  #start p { color: #9ab; font-size: 14px; max-width: 320px; line-height: 1.5; }
+  #start button { background: #1a6fb0; padding: 14px 28px; font-size: 17px; border-radius: 12px; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity 0.25s; }
+  #err { color: #f88; font-size: 13px; max-width: 320px; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>🐠 aqua-pics</h1>
+  <p>De-blue your reef tank photos, live. Allow camera access, then tap something in the tank that should be white or gray (sand, a rock, a frag plug) to white-balance.</p>
+  <button id="startBtn">Start camera</button>
+  <div id="err"></div>
+</div>
+
+<div id="stage"><canvas id="cv"></canvas></div>
+<div id="hint">Tap something white/gray in the tank to color-correct</div>
+
+<div id="panel" hidden>
+  <div class="row"><label>Strength</label><input type="range" id="strength" min="0" max="100" value="100"></div>
+  <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
+  <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
+  <div class="buttons">
+    <button id="reset">Reset</button>
+    <button id="preset">Reef preset</button>
+    <button id="shutter" aria-label="Take photo"></button>
+    <button id="compare">Hold: original</button>
+  </div>
+</div>
+
+<div id="flash"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+const VS = `
+attribute vec2 p;
+varying vec2 uv;
+void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }
+`;
+
+// White balance is applied in (approximately) linear light: decode sRGB,
+// apply per-channel gains + exposure, adjust saturation, re-encode.
+const FS = `
+precision mediump float;
+varying vec2 uv;
+uniform sampler2D tex;
+uniform vec3 gains;
+uniform float exposure;
+uniform float saturation;
+uniform float bypass;
+void main() {
+  vec3 c = texture2D(tex, uv).rgb;
+  vec3 lin = pow(c, vec3(2.2));
+  lin *= gains * exposure;
+  float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  lin = mix(vec3(luma), lin, saturation);
+  vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
+  gl_FragColor = vec4(mix(outc, c, bypass), 1.0);
+}
+`;
+
+const video = document.createElement("video");
+video.setAttribute("playsinline", "");
+video.muted = true;
+
+const cv = $("cv");
+const gl = cv.getContext("webgl", { preserveDrawingBuffer: true });
+let prog, uGains, uExposure, uSaturation, uBypass;
+
+// Offscreen 2D canvas used only to sample pixels for tap-to-white-balance.
+const sampleCv = document.createElement("canvas");
+const sampleCtx = sampleCv.getContext("2d", { willReadFrequently: true });
+
+let wbGains = [1, 1, 1];   // computed from tap or preset, before strength lerp
+let comparing = false;
+
+function initGL() {
+  function shader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  prog = gl.createProgram();
+  gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+  uGains = gl.getUniformLocation(prog, "gains");
+  uExposure = gl.getUniformLocation(prog, "exposure");
+  uSaturation = gl.getUniformLocation(prog, "saturation");
+  uBypass = gl.getUniformLocation(prog, "bypass");
+}
+
+function setUniforms() {
+  const t = $("strength").value / 100;
+  const g = wbGains.map(v => 1 + (v - 1) * t);
+  gl.uniform3f(uGains, g[0], g[1], g[2]);
+  gl.uniform1f(uExposure, Math.pow(2, $("exposure").value / 50));
+  gl.uniform1f(uSaturation, $("saturation").value / 100);
+  gl.uniform1f(uBypass, comparing ? 1 : 0);
+}
+
+function frame() {
+  if (video.readyState >= 2) {
+    if (cv.width !== video.videoWidth) {
+      cv.width = video.videoWidth;
+      cv.height = video.videoHeight;
+      gl.viewport(0, 0, cv.width, cv.height);
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    setUniforms();
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  requestAnimationFrame(frame);
+}
+
+// --- tap to white-balance -------------------------------------------------
+cv.addEventListener("pointerdown", e => {
+  if (video.readyState < 2) return;
+  const r = cv.getBoundingClientRect();
+  const x = Math.round((e.clientX - r.left) / r.width * video.videoWidth);
+  const y = Math.round((e.clientY - r.top) / r.height * video.videoHeight);
+
+  // Average a small patch of the *raw* video around the tap point.
+  const N = 12;
+  sampleCv.width = sampleCv.height = N;
+  sampleCtx.drawImage(video, x - N / 2, y - N / 2, N, N, 0, 0, N, N);
+  const d = sampleCtx.getImageData(0, 0, N, N).data;
+  let rs = 0, gs = 0, bs = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    rs += Math.pow(d[i] / 255, 2.2);
+    gs += Math.pow(d[i + 1] / 255, 2.2);
+    bs += Math.pow(d[i + 2] / 255, 2.2);
+  }
+  const n = d.length / 4;
+  rs /= n; gs /= n; bs /= n;
+  if (gs < 0.002) return; // too dark to trust
+
+  // Gains that make the patch neutral, normalized to green.
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  wbGains = [clamp(gs / Math.max(rs, 1e-4), 0.25, 12), 1, clamp(gs / Math.max(bs, 1e-4), 0.25, 12)];
+  $("hint").style.opacity = 0;
+});
+
+// --- controls ---------------------------------------------------------------
+$("reset").onclick = () => {
+  wbGains = [1, 1, 1];
+  $("strength").value = 100; $("exposure").value = 0; $("saturation").value = 100;
+  $("hint").style.opacity = 1;
+};
+$("preset").onclick = () => { wbGains = [2.6, 1.0, 0.55]; $("hint").style.opacity = 0; };
+
+const cmp = $("compare");
+const cmpOn = e => { e.preventDefault(); comparing = true; };
+const cmpOff = () => { comparing = false; };
+cmp.addEventListener("pointerdown", cmpOn);
+cmp.addEventListener("pointerup", cmpOff);
+cmp.addEventListener("pointercancel", cmpOff);
+cmp.addEventListener("pointerleave", cmpOff);
+
+$("shutter").onclick = async () => {
+  const flash = $("flash");
+  flash.style.opacity = 0.8;
+  setTimeout(() => flash.style.opacity = 0, 120);
+  const blob = await new Promise(res => cv.toBlob(res, "image/jpeg", 0.92));
+  if (!blob) return;
+  const file = new File([blob], "aqua-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg",
+                        { type: "image/jpeg" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return; } catch (e) { /* user cancelled */ }
+  } else {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = file.name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+};
+
+// --- startup ----------------------------------------------------------------
+$("startBtn").onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: "environment",
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    initGL();
+    $("start").hidden = true;
+    $("panel").hidden = false;
+    requestAnimationFrame(frame);
+  } catch (e) {
+    $("err").textContent = e.name === "NotAllowedError"
+      ? "Camera permission denied. Enable it in Settings → Safari → Camera."
+      : "Camera error: " + e.message;
+  }
+};
+</script>
+</body>
+</html>
