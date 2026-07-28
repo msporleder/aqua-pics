@@ -196,9 +196,12 @@ void main() {
   vec3 corrected = max(LMS2RGB * ((RGB2LMS * lin) * lmsGains), 0.0) * tint;
 
   // Fluorescence protection: pixels colored like the water cast get full
-  // correction; pixels glowing in their own color keep it.
+  // correction; pixels glowing in their own color keep it. Gate by
+  // brightness — emitters glow above the dim scene, reflective surfaces
+  // (tan coral branches, rock) are dim and need correction, not protection.
   float sim = dot(normalize(lin + vec3(1e-4)), waterDir);
-  float protect = (1.0 - smoothstep(0.86, 0.99, sim)) * fluorKeep;
+  float glow = smoothstep(0.03, 0.14, dot(lin, LW));
+  float protect = (1.0 - smoothstep(0.86, 0.99, sim)) * fluorKeep * glow;
   lin = mix(corrected, lin, protect) * exposure;
 
   // Hable filmic curve, normalized to its value at white point 11.2.
