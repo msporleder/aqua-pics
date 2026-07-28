@@ -759,6 +759,16 @@ $("startBtn").onclick = async () => {
     camTrack = track;
     const caps = track.getCapabilities ? track.getCapabilities() : {};
     if (caps.zoom && caps.zoom.max > caps.zoom.min) camZoomCaps = caps.zoom;
+    // Lock ISP white balance if we can: our correction is calibrated against
+    // the frames as delivered, so continuous WB re-guessing under it makes
+    // tap-WB go stale. Let auto WB settle briefly, then freeze it.
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes("manual")) {
+      setTimeout(() => {
+        track.applyConstraints({ advanced: [{ whiteBalanceMode: "manual" }] })
+          .then(() => buildCamControls(track))
+          .catch(() => {});
+      }, 1500);
+    }
     buildCamControls(track);
     await video.play();
     // Wait until real frame dimensions are known before first draw.
