@@ -27,6 +27,7 @@
   #sliders, #camCtl, #presets, #more { display: flex; flex-direction: column; gap: 8px; }
   .collapsed { display: none !important; }
   #camCtl { max-height: 40vh; overflow-y: auto; }
+  #lens, #camCaps { display: contents; }
   #camCtl .row label { width: 92px; }
   #camCtl select {
     flex: 1; background: rgba(255,255,255,0.14); color: #eee;
@@ -94,7 +95,7 @@
     <div class="row"><label>Exposure</label><input type="range" id="exposure" min="-100" max="100" value="0"></div>
     <div class="row"><label>Saturation</label><input type="range" id="saturation" min="0" max="200" value="100"></div>
   </div>
-  <div id="camCtl" class="collapsed"></div>
+  <div id="camCtl" class="collapsed"><div id="lens"></div><div id="camCaps"></div></div>
   <div id="presets" class="collapsed">
     <div class="row" style="font-size:11px;color:#9ab">What are you looking at? Picks the correction to match your eyes.</div>
     <div class="row">
@@ -108,6 +109,7 @@
     <div class="row">
       <button id="reset">Reset</button>
       <button id="compare">Hold: original</button>
+      <button id="capsBtn">Caps</button>
     </div>
   </div>
   <div class="buttons">
@@ -289,7 +291,7 @@ function lumaThumb() {
 
 function sad(a, b, dx, dy) { // sum of absolute differences at integer offset
   let s = 0, n = 0;
-  const M = 4; // margin
+  const M = 6; // margin must exceed the search radius or offsets index out of bounds
   for (let y = M; y < MH - M; y += 2) {
     for (let x = M; x < MW - M; x += 2) {
       const j = (y + dy) * MW + (x + dx);
@@ -622,7 +624,7 @@ const CAM_SKIP = new Set(["width", "height", "aspectRatio", "frameRate",
 function buildCamControls(track) {
   const caps = track.getCapabilities ? track.getCapabilities() : {};
   const settings = track.getSettings ? track.getSettings() : {};
-  const box = $("camCtl");
+  const box = $("camCaps");
   box.innerHTML = "";
   let count = 0;
 
@@ -748,39 +750,108 @@ $("shutter").onclick = async () => {
   }
 };
 
+// --- lens picker + startup ---------------------------------------------------
+// iOS exposes each physical lens (wide, ultra-wide, telephoto) as a separate
+// video input, each with its own capability set; the native camera's zoom
+// fuses them but a web app gets one at a time, so offer an explicit choice.
+async function openStream(deviceId) {
+  // iOS allows one live camera stream: stop the old one before asking.
+  if (video.srcObject) for (const t of video.srcObject.getTracks()) t.stop();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "environment" }),
+      width: { ideal: 3840 },
+      height: { ideal: 2160 },
+    },
+    audio: false,
+  });
+  video.srcObject = stream;
+  const track = stream.getVideoTracks()[0];
+  camTrack = track;
+  digitalZoom = 1;
+  camZoomCaps = null;
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  if (caps.zoom && caps.zoom.max > caps.zoom.min) camZoomCaps = caps.zoom;
+  // Lock ISP white balance if we can: our correction is calibrated against
+  // the frames as delivered, so continuous WB re-guessing under it makes
+  // tap-WB go stale. Let auto WB settle briefly, then freeze it.
+  if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes("manual")) {
+    setTimeout(() => {
+      if (track !== camTrack) return; // lens switched meanwhile
+      track.applyConstraints({ advanced: [{ whiteBalanceMode: "manual" }] })
+        .then(() => buildCamControls(track))
+        .catch(() => {});
+    }, 1500);
+  }
+  buildCamControls(track);
+  await video.play();
+  // Wait until real frame dimensions are known before first draw.
+  if (!video.videoWidth) {
+    await new Promise(res => video.addEventListener("loadedmetadata", res, { once: true }));
+  }
+  // Reseed the temporal average and motion tracker for the new stream.
+  prevLuma = null;
+  firstFrame = true;
+  if (cv.width) updateRes(currentZoom());
+}
+
+async function buildLensPicker() {
+  if (!navigator.mediaDevices.enumerateDevices) return;
+  const cams = (await navigator.mediaDevices.enumerateDevices())
+    .filter(d => d.kind === "videoinput");
+  const box = $("lens");
+  box.innerHTML = "";
+  if (cams.length < 2) return;
+  const row = document.createElement("div");
+  row.className = "row";
+  const label = document.createElement("label");
+  label.textContent = "lens";
+  const sel = document.createElement("select");
+  const cur = camTrack.getSettings().deviceId;
+  cams.forEach((d, i) => {
+    const o = document.createElement("option");
+    o.value = d.deviceId;
+    o.textContent = d.label || "camera " + (i + 1);
+    if (d.deviceId === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = async () => {
+    try {
+      await openStream(sel.value);
+    } catch (e) {
+      $("hint").textContent = "Lens switch failed: " + e.message;
+      $("hint").style.opacity = 1;
+    }
+    buildLensPicker(); // re-sync selection with what we actually got
+  };
+  row.appendChild(label);
+  row.appendChild(sel);
+  box.appendChild(row);
+  $("camBtn").hidden = false;
+}
+
+// Dump what this browser exposes for the current lens — share sheet lets you
+// paste it somewhere useful; alert() as fallback.
+$("capsBtn").onclick = async () => {
+  if (!camTrack) return;
+  const text = JSON.stringify({
+    device: camTrack.label,
+    capabilities: camTrack.getCapabilities ? camTrack.getCapabilities() : {},
+    settings: camTrack.getSettings ? camTrack.getSettings() : {},
+  }, null, 1);
+  if (navigator.share) {
+    try { await navigator.share({ text }); return; } catch (e) { /* cancelled */ }
+  }
+  alert(text);
+};
+
 // --- startup ----------------------------------------------------------------
 $("startBtn").onclick = async () => {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "environment",
-        width: { ideal: 3840 },
-        height: { ideal: 2160 },
-      },
-      audio: false,
-    });
-    video.srcObject = stream;
-    const track = stream.getVideoTracks()[0];
-    camTrack = track;
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.zoom && caps.zoom.max > caps.zoom.min) camZoomCaps = caps.zoom;
-    // Lock ISP white balance if we can: our correction is calibrated against
-    // the frames as delivered, so continuous WB re-guessing under it makes
-    // tap-WB go stale. Let auto WB settle briefly, then freeze it.
-    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes("manual")) {
-      setTimeout(() => {
-        track.applyConstraints({ advanced: [{ whiteBalanceMode: "manual" }] })
-          .then(() => buildCamControls(track))
-          .catch(() => {});
-      }, 1500);
-    }
-    buildCamControls(track);
-    await video.play();
-    // Wait until real frame dimensions are known before first draw.
-    if (!video.videoWidth) {
-      await new Promise(res => video.addEventListener("loadedmetadata", res, { once: true }));
-    }
+    await openStream();
     initGL();
+    // Device labels are only populated once permission is granted.
+    await buildLensPicker();
     $("start").hidden = true;
     $("panel").hidden = false;
     startLoop();
