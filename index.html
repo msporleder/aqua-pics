@@ -618,7 +618,9 @@ function tapWB(e) {
 // Enumerate everything getCapabilities() reports and build a control per
 // feature: range -> slider, enum -> dropdown, boolean -> toggle. Whatever
 // this WebKit exposes shows up automatically.
-const CAM_SKIP = new Set(["width", "height", "aspectRatio", "frameRate",
+// frameRate is deliberately NOT skipped: lower fps lets the ISP expose each
+// frame longer, which beats any post-hoc denoise in a dim tank.
+const CAM_SKIP = new Set(["width", "height", "aspectRatio",
   "facingMode", "deviceId", "groupId", "resizeMode", "zoom"]);
 
 function buildCamControls(track) {
@@ -666,7 +668,12 @@ function buildCamControls(track) {
       inp.oninput = () => apply(name, parseFloat(inp.value));
       row.appendChild(inp);
     } else {
-      continue;
+      // Nothing to vary (single-option enum, fixed range, exotic shape) —
+      // show it read-only so every discovered capability is visible.
+      const span = document.createElement("span");
+      span.style.cssText = "font-size:12px;color:#889;overflow-wrap:anywhere";
+      span.textContent = JSON.stringify(settings[name] ?? cap);
+      row.appendChild(span);
     }
     box.appendChild(row);
     count++;
